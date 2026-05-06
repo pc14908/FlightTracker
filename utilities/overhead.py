@@ -1,9 +1,11 @@
 from fr24sdk.client import Client
 from fr24sdk.exceptions import Fr24SdkError, ApiError
 from threading import Thread, Lock
-from time import sleep
+from time import sleep, time
+from datetime import datetime
 import math
 import os
+import requests
 
 try:
     # Attempt to load config data
@@ -19,88 +21,25 @@ MAX_ALTITUDE = 10000  # feet
 EARTH_RADIUS_KM = 6371
 BLANK_FIELDS = ["", "N/A", "NONE"]
 
-# ICAO aircraft type to human-readable name mapping
-AIRCRAFT_NAMES = {
-    "A20N": "Airbus A220",
-    "A21N": "Airbus A220",
-    "A225": "Airbus A400M",
-    "A300": "Airbus A300",
-    "A306": "Airbus A300-600",
-    "A310": "Airbus A310",
-    "A318": "Airbus A318",
-    "A319": "Airbus A319",
-    "A320": "Airbus A320",
-    "A321": "Airbus A321",
-    "A330": "Airbus A330",
-    "A339": "Airbus A330-900",
-    "A340": "Airbus A340",
-    "A342": "Airbus A340-200",
-    "A343": "Airbus A340-300",
-    "A345": "Airbus A340-500",
-    "A346": "Airbus A340-600",
-    "A350": "Airbus A350-900",
-    "A359": "Airbus A350-900",
-    "A35K": "Airbus A350-1000",
-    "A380": "Airbus A380-800",
-    "A388": "Airbus A380-800",
-    "A400": "Airbus A400M",
-    "B37M": "Boeing 737 MAX 7",
-    "B38M": "Boeing 737 MAX 8",
-    "B39M": "Boeing 737 MAX 9",
-    "B3XM": "Boeing 737 MAX 10",
-    "B712": "Boeing 717-200",
-    "B721": "Boeing 727-100",
-    "B722": "Boeing 727-200",
-    "B732": "Boeing 737-200",
-    "B733": "Boeing 737-300",
-    "B734": "Boeing 737-400",
-    "B735": "Boeing 737-500",
-    "B736": "Boeing 737-600",
-    "B737": "Boeing 737-700",
-    "B738": "Boeing 737-800",
-    "B739": "Boeing 737-900",
-    "B741": "Boeing 747-100",
-    "B742": "Boeing 747-200",
-    "B743": "Boeing 747-300",
-    "B744": "Boeing 747-400",
-    "B745": "Boeing 747-500",
-    "B746": "Boeing 747-600",
-    "B748": "Boeing 747-8",
-    "B752": "Boeing 757-200",
-    "B753": "Boeing 757-300",
-    "B762": "Boeing 767-200",
-    "B763": "Boeing 767-300",
-    "B764": "Boeing 767-400",
-    "B772": "Boeing 777-200",
-    "B773": "Boeing 777-300",
-    "B77L": "Boeing 777-200LR",
-    "B77W": "Boeing 777-300ER",
-    "B778": "Boeing 777-8",
-    "B779": "Boeing 777-9",
-    "B787": "Boeing 787-8",
-    "B788": "Boeing 787-8",
-    "B789": "Boeing 787-9",
-    "B78X": "Boeing 787-10",
-    "BA11": "British Aerospace 146",
-    "CRJ2": "Bombardier CRJ-200",
-    "CRJ7": "Bombardier CRJ-700",
-    "CRJ9": "Bombardier CRJ-900",
-    "E145": "Embraer ERJ-145",
-    "E170": "Embraer E170",
-    "E175": "Embraer E175",
-    "E190": "Embraer E190",
-    "E195": "Embraer E195",
-}
-
-
 def zone_dict_to_bounds_string(zone):
     """Convert zone dict (tl_y, tl_x, br_y, br_x) to bounds string (north,south,west,east)."""
     return f"{zone['tl_y']},{zone['br_y']},{zone['tl_x']},{zone['br_x']}"
 
 
-def get_aircraft_name(icao_code):
-    """Map ICAO aircraft code to human-readable name. Falls back to code if not found."""
-    return AIRCRAFT_NAMES.get(icao_code, icao_code)
+def get_aircraft_name(icao24, username, password):
+    url = f"https://opensky-network.org/api/metadata/aircraft/icao/{icao24.lower()}"
+    response = requests.get(url, auth=(username, password))
+
+    if response.status_code == 200:
+        data = response.json()
+        mfr = data.get("manufacturerName","")
+        model = data.get("model","")
+        parts = [p for p in [mfr, model] if p]
+        return " ".join(parts) if parts else icao24 # fallback to ICAO24 if no metadata available
+    else:
+        print(f"Error {response.status_code}: {response.text}")
+        return icao24 # fallback to returning the original ICAO24 code if metadata lookup fails
+
 
 try:
     # Attempt to load config data
@@ -149,17 +88,43 @@ def distance_from_flight_to_home(flight, home=LOCATION_DEFAULT):
 
 class Overhead:
     def __init__(self):
-        api_token = os.environ.get("FR24_API_TOKEN") # change for passing token directly
-        self._api = Client(api_token=api_token)
+        #api_token = os.environ.get("FR24_API_TOKEN") # change for passing token directly
+        self._api = Client(api_token="API TOKEN HERE")
         self._lock = Lock()
         self._data = []
         self._new_data = False
         self._processing = False
+        self._last_api_call = 0  # Timestamp of last API call for rate limiting
+
+    def _is_active_hour(self):
+        """Check if current time is within active hours (12:00 to 22:00)."""
+        current_hour = datetime.now().hour
+        return 12 <= current_hour < 22
+    
+    def _should_fetch_data(self):
+        """Check if enough time has passed since last API call (15 second rate limit)."""
+        return (time() - self._last_api_call) >= 15
 
     def grab_data(self):
         Thread(target=self._grab_data).start()
 
     def _grab_data(self):
+        # Check if we're outside active hours
+        if not self._is_active_hour():
+            # Outside active hours, don't fetch data
+            with self._lock:
+                self._new_data = False
+                self._processing = False
+            return
+        
+        # Check rate limit
+        if not self._should_fetch_data():
+            # Rate limit not met, don't fetch
+            with self._lock:
+                self._new_data = False
+                self._processing = False
+            return
+        
         # Mark data as old
         with self._lock:
             self._new_data = False
@@ -169,6 +134,9 @@ class Overhead:
 
         # Grab flight details
         try:
+            # Update last API call time
+            self._last_api_call = time()
+            
             # Convert zone dict to bounds string
             bounds_str = zone_dict_to_bounds_string(ZONE_DEFAULT)
             
@@ -188,8 +156,8 @@ class Overhead:
             sleep(RATE_LIMIT_DELAY)
 
             for flight in flights[:MAX_FLIGHT_LOOKUP]:
-                # Get plane type and map to human-readable name
-                plane = get_aircraft_name(flight.type) if flight.type else ""
+                # Get plane information using icao24 identifier, with fallback to icao24 if lookup fails or returns blank
+                plane = get_aircraft_name(flight.hex,"username","password") if flight.hex else ""
                 plane = plane if not (plane.upper() in BLANK_FIELDS) else ""
 
                 # Extract and clean origin airport
@@ -270,6 +238,6 @@ if __name__ == "__main__":
     o.grab_data()
     while not o.new_data:
         print("processing...")
-        sleep(15) # changed tio for sure match query time limit on paid API
+        sleep(1)
 
     print(o.data)

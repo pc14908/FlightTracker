@@ -8,6 +8,7 @@ from rgbmatrix import graphics
 from utilities.animator import Animator
 from setup import colours, fonts, frames
 from config import WEATHER_LOCATION
+from config import LOCATION_HOME
 import sys
 
 # Attempt to load config data
@@ -56,9 +57,9 @@ RAINFALL_MAX_VALUE = 3  # mm
 RAINFALL_OVERSPILL_FLASH_ENABLED = True
 
 TEMPERATURE_REFRESH_SECONDS = 60
-TEMPERATURE_FONT = fonts.extrasmall
-TEMPERATURE_FONT_HEIGHT = 5
-TEMPERATURE_POSITION = (48, TEMPERATURE_FONT_HEIGHT + 1)
+TEMPERATURE_FONT = fonts.small
+TEMPERATURE_FONT_HEIGHT = 6
+TEMPERATURE_POSITION = (44, TEMPERATURE_FONT_HEIGHT + 1)
 
 TEMPERATURE_COLOURS = (
     (0, colours.WHITE),
@@ -160,8 +161,10 @@ def grab_current_temperature_openweather(location, apikey, units):
         try:
             request = urllib.request.Request(
                 OPENWEATHER_API_URL
-                + "weather?q="
-                + location
+                + "weather?lat="
+                + str(location[0])
+                + "&lon="
+                + str(location[1])
                 + "&appid="
                 + apikey
                 + "&units="
@@ -193,7 +196,7 @@ class WeatherScene(object):
         # is provided otherwise fallback on the taps-aff service
         self._temperature_providers = [
             *( [lambda: grab_current_temperature_openweather(
-                    WEATHER_LOCATION, OPENWEATHER_API_KEY, TEMPERATURE_UNITS
+                    LOCATION_HOME, OPENWEATHER_API_KEY, TEMPERATURE_UNITS
                 )] if OPENWEATHER_API_KEY else [] ),
             lambda: grab_current_temperature(WEATHER_LOCATION, TEMPERATURE_UNITS)
         ]

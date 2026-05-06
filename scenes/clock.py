@@ -6,9 +6,9 @@ from setup import colours, fonts, frames
 from rgbmatrix import graphics
 
 # Setup
-CLOCK_FONT = fonts.regular
-CLOCK_POSITION = (1, 8)
-CLOCK_COLOUR = colours.BLUE_DARK
+CLOCK_FONT = fonts.large
+CLOCK_POSITION = (1, 10)
+CLOCK_COLOUR = colours.BLUE
 
 
 class ClockScene(object):

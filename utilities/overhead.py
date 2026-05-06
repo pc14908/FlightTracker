@@ -1,11 +1,9 @@
-from FlightRadar24.api import FlightRadar24API
+from fr24sdk.client import Client
+from fr24sdk.exceptions import Fr24SdkError, ApiError
 from threading import Thread, Lock
 from time import sleep
 import math
-
-from requests.exceptions import ConnectionError
-from urllib3.exceptions import NewConnectionError
-from urllib3.exceptions import MaxRetryError
+import os
 
 try:
     # Attempt to load config data
@@ -15,12 +13,94 @@ except (ModuleNotFoundError, NameError, ImportError):
     # If there's no config data
     MIN_ALTITUDE = 0  # feet
 
-RETRIES = 3
 RATE_LIMIT_DELAY = 1
 MAX_FLIGHT_LOOKUP = 5
 MAX_ALTITUDE = 10000  # feet
 EARTH_RADIUS_KM = 6371
 BLANK_FIELDS = ["", "N/A", "NONE"]
+
+# ICAO aircraft type to human-readable name mapping
+AIRCRAFT_NAMES = {
+    "A20N": "Airbus A220",
+    "A21N": "Airbus A220",
+    "A225": "Airbus A400M",
+    "A300": "Airbus A300",
+    "A306": "Airbus A300-600",
+    "A310": "Airbus A310",
+    "A318": "Airbus A318",
+    "A319": "Airbus A319",
+    "A320": "Airbus A320",
+    "A321": "Airbus A321",
+    "A330": "Airbus A330",
+    "A339": "Airbus A330-900",
+    "A340": "Airbus A340",
+    "A342": "Airbus A340-200",
+    "A343": "Airbus A340-300",
+    "A345": "Airbus A340-500",
+    "A346": "Airbus A340-600",
+    "A350": "Airbus A350-900",
+    "A359": "Airbus A350-900",
+    "A35K": "Airbus A350-1000",
+    "A380": "Airbus A380-800",
+    "A388": "Airbus A380-800",
+    "A400": "Airbus A400M",
+    "B37M": "Boeing 737 MAX 7",
+    "B38M": "Boeing 737 MAX 8",
+    "B39M": "Boeing 737 MAX 9",
+    "B3XM": "Boeing 737 MAX 10",
+    "B712": "Boeing 717-200",
+    "B721": "Boeing 727-100",
+    "B722": "Boeing 727-200",
+    "B732": "Boeing 737-200",
+    "B733": "Boeing 737-300",
+    "B734": "Boeing 737-400",
+    "B735": "Boeing 737-500",
+    "B736": "Boeing 737-600",
+    "B737": "Boeing 737-700",
+    "B738": "Boeing 737-800",
+    "B739": "Boeing 737-900",
+    "B741": "Boeing 747-100",
+    "B742": "Boeing 747-200",
+    "B743": "Boeing 747-300",
+    "B744": "Boeing 747-400",
+    "B745": "Boeing 747-500",
+    "B746": "Boeing 747-600",
+    "B748": "Boeing 747-8",
+    "B752": "Boeing 757-200",
+    "B753": "Boeing 757-300",
+    "B762": "Boeing 767-200",
+    "B763": "Boeing 767-300",
+    "B764": "Boeing 767-400",
+    "B772": "Boeing 777-200",
+    "B773": "Boeing 777-300",
+    "B77L": "Boeing 777-200LR",
+    "B77W": "Boeing 777-300ER",
+    "B778": "Boeing 777-8",
+    "B779": "Boeing 777-9",
+    "B787": "Boeing 787-8",
+    "B788": "Boeing 787-8",
+    "B789": "Boeing 787-9",
+    "B78X": "Boeing 787-10",
+    "BA11": "British Aerospace 146",
+    "CRJ2": "Bombardier CRJ-200",
+    "CRJ7": "Bombardier CRJ-700",
+    "CRJ9": "Bombardier CRJ-900",
+    "E145": "Embraer ERJ-145",
+    "E170": "Embraer E170",
+    "E175": "Embraer E175",
+    "E190": "Embraer E190",
+    "E195": "Embraer E195",
+}
+
+
+def zone_dict_to_bounds_string(zone):
+    """Convert zone dict (tl_y, tl_x, br_y, br_x) to bounds string (north,south,west,east)."""
+    return f"{zone['tl_y']},{zone['br_y']},{zone['tl_x']},{zone['br_x']}"
+
+
+def get_aircraft_name(icao_code):
+    """Map ICAO aircraft code to human-readable name. Falls back to code if not found."""
+    return AIRCRAFT_NAMES.get(icao_code, icao_code)
 
 try:
     # Attempt to load config data
@@ -36,6 +116,7 @@ except (ModuleNotFoundError, NameError, ImportError):
 
 
 def distance_from_flight_to_home(flight, home=LOCATION_DEFAULT):
+    # This works if flight is an object FROM the flights list, but NOT if it is the raw flights list
     def polar_to_cartesian(lat, long, alt):
         DEG2RAD = math.pi / 180
         return [
@@ -50,9 +131,9 @@ def distance_from_flight_to_home(flight, home=LOCATION_DEFAULT):
 
     try:
         (x0, y0, z0) = polar_to_cartesian(
-            flight.latitude,
-            flight.longitude,
-            feet_to_meters_plus_earth(flight.altitude),
+            flight.lat,
+            flight.lon,
+            feet_to_meters_plus_earth(flight.alt),
         )
 
         (x1, y1, z1) = polar_to_cartesian(*home)
@@ -68,7 +149,8 @@ def distance_from_flight_to_home(flight, home=LOCATION_DEFAULT):
 
 class Overhead:
     def __init__(self):
-        self._api = FlightRadar24API()
+        api_token = os.environ.get("FR24_API_TOKEN") # change for passing token directly
+        self._api = Client(api_token=api_token)
         self._lock = Lock()
         self._data = []
         self._new_data = False
@@ -87,78 +169,78 @@ class Overhead:
 
         # Grab flight details
         try:
-            bounds = self._api.get_bounds(ZONE_DEFAULT)
-            flights = self._api.get_flights(bounds=bounds)
+            # Convert zone dict to bounds string
+            bounds_str = zone_dict_to_bounds_string(ZONE_DEFAULT)
+            
+            # Fetch live flight positions
+            flights_response = self._api.live.flight_positions.get_full(bounds=bounds_str)
+            flights = flights_response.data if flights_response.data else []
 
             # Sort flights by closest first
             flights = [
                 f
                 for f in flights
-                if f.altitude < MAX_ALTITUDE and f.altitude > MIN_ALTITUDE
+                if f.alt < MAX_ALTITUDE and f.alt > MIN_ALTITUDE
             ]
             flights = sorted(flights, key=lambda f: distance_from_flight_to_home(f))
 
+            # Rate limit protection
+            sleep(RATE_LIMIT_DELAY)
+
             for flight in flights[:MAX_FLIGHT_LOOKUP]:
-                retries = RETRIES
+                # Get plane type and map to human-readable name
+                plane = get_aircraft_name(flight.type) if flight.type else ""
+                plane = plane if not (plane.upper() in BLANK_FIELDS) else ""
 
-                while retries:
-                    # Rate limit protection
-                    sleep(RATE_LIMIT_DELAY)
+                # Extract and clean origin airport
+                origin = (
+                    flight.orig_iata
+                    if flight.orig_iata and not (flight.orig_iata.upper() in BLANK_FIELDS)
+                    else ""
+                )
 
-                    # Grab and store details
-                    try:
-                        details = self._api.get_flight_details(flight)
+                # Extract and clean destination airport
+                destination = (
+                    flight.dest_iata
+                    if flight.dest_iata and not (flight.dest_iata.upper() in BLANK_FIELDS)
+                    else ""
+                )
 
-                        # Get plane type
-                        try:
-                            plane = details["aircraft"]["model"]["text"]
-                        except (KeyError, TypeError):
-                            plane = ""
+                # Extract and clean callsign
+                callsign = (
+                    flight.callsign
+                    if flight.callsign and not (flight.callsign.upper() in BLANK_FIELDS)
+                    else ""
+                )
 
-                        # Tidy up what we pass along
-                        plane = plane if not (plane.upper() in BLANK_FIELDS) else ""
-
-                        origin = (
-                            flight.origin_airport_iata
-                            if not (flight.origin_airport_iata.upper() in BLANK_FIELDS)
-                            else ""
-                        )
-
-                        destination = (
-                            flight.destination_airport_iata
-                            if not (flight.destination_airport_iata.upper() in BLANK_FIELDS)
-                            else ""
-                        )
-
-                        callsign = (
-                            flight.callsign
-                            if not (flight.callsign.upper() in BLANK_FIELDS)
-                            else ""
-                        )
-
-                        data.append(
-                            {
-                                "plane": plane,
-                                "origin": origin,
-                                "destination": destination,
-                                "vertical_speed": flight.vertical_speed,
-                                "altitude": flight.altitude,
-                                "callsign": callsign,
-                            }
-                        )
-                        break
-
-                    except (KeyError, AttributeError):
-                        retries -= 1
+                data.append(
+                    {
+                        "plane": plane,
+                        "origin": origin,
+                        "destination": destination,
+                        "vertical_speed": flight.vspeed,
+                        "altitude": flight.alt,
+                        "callsign": callsign,
+                    }
+                )
 
             with self._lock:
                 self._new_data = True
                 self._processing = False
                 self._data = data
 
-        except (ConnectionError, NewConnectionError, MaxRetryError):
-            self._new_data = False
-            self._processing = False
+        except (Fr24SdkError, ApiError) as e:
+            # Log error but don't crash
+            print(f"Error fetching flight data from FR24 API: {e}")
+            with self._lock:
+                self._new_data = False
+                self._processing = False
+        except Exception as e:
+            # Catch any other unexpected errors
+            print(f"Unexpected error in _grab_data: {e}")
+            with self._lock:
+                self._new_data = False
+                self._processing = False
 
     @property
     def new_data(self):
@@ -188,6 +270,6 @@ if __name__ == "__main__":
     o.grab_data()
     while not o.new_data:
         print("processing...")
-        sleep(1)
+        sleep(15) # changed tio for sure match query time limit on paid API
 
     print(o.data)
